@@ -1,13 +1,13 @@
 import { Hono } from 'hono';
 import { serveStatic } from 'hono/bun';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join, extname, resolve, isAbsolute } from 'node:path';
 
 type Word = { start: number; end: number; text: string };
 type Candidate = { id: number; start: number; end: number; text: string; score: number; reason: string };
 type Job = { id: string; filename: string; words: Word[]; candidates: Candidate[]; duration: number; transcriptAvailable: boolean; whisperModel: string; whisperLanguage: string; whisperDevice?: string; detectedLanguage?: string; transcriptionError?: string };
-type CaptionStyle = 'pop' | 'clean' | 'neon';
+type CaptionStyle = 'pop' | 'clean' | 'neon' | 'classic';
 const app = new Hono();
 const root = process.cwd();
 const dataRoot = join(root, 'data');
@@ -89,6 +89,7 @@ const assStyles: Record<CaptionStyle, string> = {
   pop: 'Style: Pop,Arial,64,&H003BEBFF,&H00FFFFFF,&H00000000,&H66000000,-1,0,0,0,100,100,0,0,1,3,1,2,70,70,650,1',
   clean: 'Style: Clean,Arial,58,&H003BEBFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,1,2,70,70,650,1',
   neon: 'Style: Neon,Arial,60,&H003BEBFF,&H00FFFFFF,&H00000000,&H70090909,-1,0,0,0,100,100,0,0,1,3,1,2,70,70,650,1',
+  classic: 'Style: Classic,Montserrat ExtraBold,84,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1',
 };
 function assTime(seconds: number): string {
   const cs = Math.max(0, Math.round(seconds * 100));
@@ -97,6 +98,48 @@ function assTime(seconds: number): string {
 }
 function makeAss(words: Word[], start: number, end: number, style: CaptionStyle): string {
   const selected = words.filter(w => w.end > start && w.start < end && w.text.trim());
+  if (style === 'classic') {
+    const groups: Word[][] = [];
+    let line: Word[] = [];
+    for (const word of selected) {
+      const previous = line.at(-1);
+      if (line.length >= 3 || (previous && /[.!?]$/.test(previous.text.trim()))
+          || (previous && word.start - previous.end > 0.6)) {
+        if (line.length) groups.push(line);
+        line = [];
+      }
+      line.push(word);
+    }
+    if (line.length) groups.push(line);
+    const events: string[] = [];
+    groups.forEach((group, groupIndex) => {
+      const nextGroupStart = groups[groupIndex + 1]?.[0]?.start ?? end;
+      const groupEnd = Math.min(end, group.at(-1)!.end + 0.15, nextGroupStart);
+      group.forEach((active, activeIndex) => {
+        const cueStart = Math.max(0, active.start - start);
+        const nextWordStart = group[activeIndex + 1]?.start;
+        const cueEnd = Math.min(end - start, nextWordStart === undefined ? groupEnd - start : nextWordStart - start);
+        let text = '';
+        let plainLine = '';
+        let lineCount = 1;
+        group.forEach((word, wordIndex) => {
+          const token = word.text.trim().toLocaleUpperCase().replace(/[{}]/g, '');
+          const separator = /^[.,!?;:%)}\]]/.test(token) ? '' : (plainLine ? ' ' : '');
+          if (plainLine && plainLine.length + separator.length + token.length > 22 && lineCount === 1) {
+            text += '\\N';
+            plainLine = '';
+            lineCount++;
+          }
+          const gap = /^[.,!?;:%)}\]]/.test(token) ? '' : (plainLine ? ' ' : '');
+          text += `${gap}${wordIndex === activeIndex ? '{\\c&H00E5FF&\\fscx112\\fscy112}' : ''}${token}${wordIndex === activeIndex ? '{\\r}' : ''}`;
+          plainLine += gap + token;
+        });
+        events.push(`Dialogue: 0,${assTime(cueStart)},${assTime(Math.max(cueStart + 0.08, cueEnd))},Classic,,0,0,0,,{\\pos(540,1250)}${text}`);
+      });
+    });
+    if (!events.length) return '';
+    return `[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n${assStyles.classic}\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n${events.join('\n')}\n`;
+  }
   const groups: Word[][] = []; let group: Word[] = [];
   const join = (items: Word[]) => items.reduce((out, word) => {
     const token = word.text.trim();
@@ -104,7 +147,8 @@ function makeAss(words: Word[], start: number, end: number, style: CaptionStyle)
   }, '');
   for (const word of selected) {
     const candidate = [...group, word];
-    if (group.length && (candidate.length > 5 || word.end - group[0]!.start > 2.5 || join(candidate).length > 34)) { groups.push(group); group = []; }
+    const maxWords = style === 'classic' ? 3 : 5;
+    if (group.length && (candidate.length > maxWords || word.end - group[0]!.start > 2.5 || join(candidate).length > (style === 'classic' ? 30 : 34))) { groups.push(group); group = []; }
     group.push(word);
     if (/[.!?]$/.test(word.text.trim()) && group.length >= 2) { groups.push(group); group = []; }
   }
@@ -193,7 +237,7 @@ app.post('/api/jobs/:id/export', async c => {
   const job = await loadJob(c.req.param('id'));
   if (!job) return c.json({ error: 'Process a video first.' }, 404);
   try {
-    const body = await c.req.json() as { start: number; end: number; text: string; vertical: boolean; style?: CaptionStyle };
+    const body = await c.req.json() as { start: number; end: number; text: string; vertical: boolean; style?: CaptionStyle; layout?: 'auto' | 'blur' };
     const dir = join(dataRoot, job.id); const files = await Array.fromAsync(new Bun.Glob('source.*').scan({ cwd: dir }));
     const source = join(dir, files[0] || ''); const output = join(dir, `clip-${Math.round(body.start)}-${Math.round(body.end)}.mp4`);
     const caption = body.text.replace(/\s+/g, ' ').trim().replace(/[{}]/g, '');
@@ -208,14 +252,39 @@ app.post('/api/jobs/:id/export', async c => {
       await writeFile(captionPath, lines.join('\n'), 'utf8');
     }
     const captionFile = `data/${job.id}/${ass ? 'captions.ass' : 'caption.txt'}`;
+    let renderedLayout: 'blur' | 'stack' = 'blur';
+    let layoutMessage: string | undefined;
+    let videoInput = source;
+    let ffmpegArgs: string[];
+    const requestedLayout = body.vertical ? (body.layout || 'auto') : 'blur';
+    if (body.vertical && requestedLayout !== 'blur') {
+      const stacked = join(dir, `stacked-${Math.round(body.start)}-${Math.round(body.end)}.mp4`);
+      try {
+        await run('.venv/Scripts/python.exe', ['scripts/facecam_stack.py', source, String(body.start), String(body.end), stacked, join(root, 'assets/face_landmarker.task')], 30 * 60 * 1000);
+        videoInput = stacked;
+        renderedLayout = 'stack';
+      } catch (error) {
+        layoutMessage = error instanceof Error
+          ? error.message.split(/\r?\n/).filter(Boolean).at(-1)
+          : 'No stable facecam was found.';
+        console.warn(`Facecam stack unavailable; using blurred layout: ${layoutMessage}`);
+        await unlink(stacked).catch(() => {});
+      }
+    }
     const graph = body.vertical
       ? `[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:12,eq=brightness=-0.25[bgblur];[fg]scale=1080:-2:force_original_aspect_ratio=decrease[fgfit];[bgblur][fgfit]overlay=(W-w)/2:(H-h)/2[base]`
       : '[0:v]scale=1920:-2:force_original_aspect_ratio=decrease[base]';
     const fallbackCaption = caption ? `drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':textfile='${captionFile}':fontcolor=white:fontsize=48:borderw=3:bordercolor=black:box=1:boxcolor=${style === 'neon' ? '0xC900FF@0.92' : style === 'clean' ? 'black@0.42' : '0xD9A500@0.94'}:boxborderw=14:x=(w-text_w)/2:y=h*0.72` : 'null';
-    const overlay = ass ? `subtitles=filename='${captionFile}'` : fallbackCaption;
-    const filters = `${graph};[base]${overlay}[outv]`;
-    await run('ffmpeg', ['-y','-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',output], 30 * 60 * 1000);
-    return c.json({ url: `/api/jobs/${job.id}/download/${encodeURIComponent(output.split(/[\\/]/).at(-1)!)}` });
+    const overlay = ass ? `subtitles=filename='${captionFile}':fontsdir='assets/fonts'` : fallbackCaption;
+    const filters = renderedLayout === 'stack'
+      ? `[0:v]${overlay}[outv]`
+      : `${graph};[base]${overlay}[outv]`;
+    ffmpegArgs = renderedLayout === 'stack'
+      ? ['-y','-i',videoInput,'-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','1:a:0?','-c:v','libx264','-preset','veryfast','-crf','22','-c:a','aac','-b:a','160k','-movflags','+faststart',output]
+      : ['-y','-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',output];
+    try { await run('ffmpeg', ffmpegArgs, 30 * 60 * 1000); }
+    finally { if (renderedLayout === 'stack') await unlink(videoInput).catch(() => {}); }
+    return c.json({ url: `/api/jobs/${job.id}/download/${encodeURIComponent(output.split(/[\\/]/).at(-1)!)}`, layout: renderedLayout, layoutMessage });
   } catch (e) { return c.json({ error: e instanceof Error ? e.message : 'Export failed.' }, 500); }
 });
 app.get('/api/jobs/:id/download/:filename', async c => {

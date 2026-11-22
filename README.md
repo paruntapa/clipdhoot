@@ -1,6 +1,6 @@
 # Clip Dhoot
 
-Clip Dhoot turns a downloaded stream or video into suggested short-form clips. Whisper transcription, moment suggestions, caption timing, and FFmpeg exports run locally. The app defaults to Whisper large-v3, tries a supported GPU backend first, and falls back to CPU int8. OpenRouter is optional and is only used when you ask it to rank suggested moments.
+Clip Dhoot turns a downloaded stream or video into suggested short-form clips. Whisper transcription, moment suggestions, face tracking, caption timing, and FFmpeg exports run locally. The app defaults to Whisper large-v3, tries a supported GPU backend first, and falls back to CPU int8. MediaPipe face tracking runs locally on the CPU. OpenRouter is optional and is only used when you ask it to rank suggested moments.
 
 ## 1. Install prerequisites (Windows)
 
@@ -42,8 +42,9 @@ Open [http://localhost:3000](http://localhost:3000). Keep that terminal open whi
 1. Choose a Whisper model and the language spoken in the stream. For English streams, **large-v3 + English** is the accuracy-first default; choose **medium.en** for faster CPU processing.
 2. Select or drop a video file. Wait for transcription and candidate moments. Longer videos take longer to process.
 3. Click a candidate time range to preview it. Review the context, then adjust its In and Out times.
-4. Choose **Pop**, **Clean**, or **Neon** under Caption look. Whisper captions are split into short, word-timed groups; the active word highlights as it is spoken.
-5. Click **Export clip**. The app renders a 9:16 MP4 and downloads it through your browser. Watch the finished clip and correct any Whisper errors before posting.
+4. Choose **Facecam + gameplay (auto)** or **Blurred background** under Video layout. Auto analyzes the selected time range for a stable facecam, tracks its position into the top panel, and crops gameplay for the lower panel. If it cannot find a clean webcam layout, it exports the blurred layout and explains why.
+5. Choose **Classic**, **Pop**, **Clean**, or **Neon** under Caption look. Classic uses bold Montserrat captions with a black outline and highlights the spoken word in yellow. Captions are timed from Whisper word timestamps.
+6. Click **Export clip**. The app renders a 9:16 MP4 and downloads it through your browser. Watch the finished clip and correct any Whisper errors before posting.
 
 ## Whisper model and language choices
 
@@ -51,6 +52,8 @@ Open [http://localhost:3000](http://localhost:3000). Keep that terminal open whi
 - `small.en` and `medium.en` are English-only alternatives; `medium.en` is a good balance when CPU speed matters.
 - `small` and `medium` support multiple languages. Choose the spoken language when known; use Auto detect when it varies.
 - A forced language can help when auto-detection mistakes slang, names, or noisy speech for another language. The app reports the model, execution device, and detected language after processing.
+
+Facecam framing runs only when exporting a selected clip, so it does not add time to the initial video scan. OpenCV YuNet detects the stable webcam overlay and its borders, while MediaPipe landmarks refine the face centre; both run locally on the CPU and do not use the RX 7600 ROCm backend. The models and Montserrat font are included under `assets/` with their licenses in `assets/THIRD_PARTY_NOTICES.md`. A facecam that is too small, moves between regions, or overlaps the gameplay crop may not produce a clean stack; use **Blurred background** in that case.
 
 The app uses `faster-whisper`; there is no separate Whisper server to install. GPU acceleration depends on a GPU-enabled CTranslate2 runtime. NVIDIA requires its compatible CUDA/cuDNN runtime; AMD GPUs require a ROCm/HIP-enabled CTranslate2 build. If no usable backend is detected, the app safely uses CPU int8.
 

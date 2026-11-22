@@ -129,7 +129,7 @@ function render(candidates) {
         const response = await fetch(`/api/jobs/${job.id}/export`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ start, end, text: card.querySelector('.caption').value, vertical: true, style: $('#captionStyle').value }),
+          body: JSON.stringify({ start, end, text: card.querySelector('.caption').value, vertical: true, style: $('#captionStyle').value, layout: $('#exportLayout').value }),
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Clip export failed.');
@@ -137,7 +137,11 @@ function render(candidates) {
         anchor.href = result.url;
         anchor.download = 'clip.mp4';
         anchor.click();
-        toast('Clip rendered and downloaded.');
+        toast(result.layout === 'stack'
+          ? 'Facecam + gameplay clip rendered and downloaded.'
+          : result.layoutMessage
+            ? `Facecam not detected; downloaded the blurred layout. ${result.layoutMessage}`
+            : 'Clip rendered and downloaded.');
       } catch (error) {
         toast(error instanceof Error ? error.message : 'Clip export failed.', true);
       } finally {
