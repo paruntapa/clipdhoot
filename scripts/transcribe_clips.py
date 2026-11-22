@@ -46,6 +46,57 @@ def make_captions(words):
     return "\n\n".join(entries) + ("\n" if entries else "")
 
 
+
+def make_ass(words):
+    groups = []
+    current = []
+    for word in words:
+        token = word["text"].strip()
+        if not token:
+            continue
+        if current and (len(current) >= 5 or word["end"] - current[0]["start"] > 2.6):
+            groups.append(current)
+            current = []
+        current.append(word)
+        if token.endswith((".", "?", "!")) and len(current) >= 2:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+
+    def ts(value):
+        cs = max(0, round(value * 100))
+        h, cs = divmod(cs, 360000)
+        m, cs = divmod(cs, 6000)
+        sec, cs = divmod(cs, 100)
+        return f"{h}:{m:02}:{sec:02}.{cs:02}"
+
+    events = []
+    for group in groups:
+        chunks = []
+        for word in group:
+            token = word["text"].strip().upper().replace("{", "(").replace("}", ")")
+            gap = "" if token[:1] in ".,!?;:%)]'?" else (" " if chunks else "")
+            duration = max(2, round((word["end"] - word["start"]) * 100))
+            chunks.append(f"{gap}{{\\kf{duration}}}{token}")
+        start, end = group[0]["start"], max(group[-1]["end"], group[0]["start"] + 0.4)
+        events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Pop,,0,0,0,,{{\\fad(80,100)}}{''.join(chunks)}")
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Pop,Arial,64,&H004DD8FF,&H00FFFFFF,&H00141414,&H66000000,-1,0,0,0,100,100,0,0,3,3,1,2,70,70,650,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+    return header + "\n".join(events) + "\n"
+
 def main(paths):
     model = WhisperModel("small", device="cpu", compute_type="int8")
     for arg in paths:
@@ -59,9 +110,11 @@ def main(paths):
                 words.extend({"start": round(word.start, 3), "end": round(word.end, 3), "text": word.word} for word in segment.words)
         srt_path = path.with_name(path.stem + ".srt")
         json_path = path.with_name(path.stem + ".transcript.json")
+        ass_path = path.with_name(path.stem + ".ass")
         srt_path.write_text(make_captions(words), encoding="utf-8")
         json_path.write_text(json.dumps({"language": info.language, "segments": text_segments}, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"{path.name}: {len(words)} words, {len(text_segments)} transcript segments, language={info.language}, captions={srt_path}")
+        ass_path.write_text(make_ass(words), encoding="utf-8")
+        print(f"{path.name}: {len(words)} words, {len(text_segments)} transcript segments, language={info.language}, captions={srt_path}, styled={ass_path}")
 
 
 if __name__ == "__main__":
