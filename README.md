@@ -1,6 +1,6 @@
-# Clip Dhoot
+# Clip mocha
 
-Clip Dhoot turns a downloaded stream or video into suggested short-form clips. Whisper transcription, moment suggestions, face tracking, caption timing, and FFmpeg exports run locally. The app defaults to Whisper large-v3, tries a supported GPU backend first, and falls back to CPU int8. MediaPipe face tracking runs locally on the CPU. OpenRouter is optional and is only used when you ask it to rank suggested moments.
+Clip mocha turns a downloaded video or a public Twitch live stream into suggested short-form clips. Streamlink captures the live stream, FFmpeg stores timestamped chunks, and a persistent local Whisper worker analyzes them as capture continues. Moment suggestions, face tracking, caption timing, and FFmpeg exports run locally. Whisper tries a supported GPU backend first and falls back to CPU int8. OpenRouter is optional and is only used when you ask it to rank suggested moments.
 
 ## 1. Install prerequisites (Windows)
 
@@ -18,8 +18,8 @@ Open a new PowerShell window and confirm `bun --version`, `py -3.11 --version`, 
 Replace `<repository-url>` with the Git URL for this project:
 
 ```powershell
-git clone <repository-url> clipdhoot
-cd clipdhoot
+git clone <repository-url> clipmocha
+cd clipmocha
 bun install
 py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
@@ -46,6 +46,15 @@ Open [http://localhost:3000](http://localhost:3000). Keep that terminal open whi
 5. Choose **Classic**, **Pop**, **Clean**, or **Neon** under Caption look. Classic uses bold Montserrat captions with a black outline and highlights the spoken word in yellow. Captions are timed from Whisper word timestamps.
 6. Click **Export clip**. The app renders a 9:16 MP4 and downloads it through your browser. Watch the finished clip and correct any Whisper errors before posting.
 
+## Capture a live Twitch stream
+
+1. Paste a public Twitch channel URL such as `https://www.twitch.tv/channelname` into **Capture a live stream**.
+2. Use the same Whisper model and language selectors as for a video. The stream is captured immediately while the model loads.
+3. The app writes approximately 60-second video chunks, remuxes each finished chunk, and transcribes it locally. New candidate cards appear after a chunk has been captured and analyzed; the app does not wait for the stream to end.
+4. Review and export ready candidates while capture continues. Stop with **Stop live capture**; Clip mocha finishes the current segment and then processes the final chunk.
+
+The live MVP currently accepts public Twitch channel links. A chunk must finish before it can be transcribed, so suggestions are delayed by the chunk length plus local transcription time. With a slower CPU or a large Whisper model, transcription can fall behind capture and use additional disk space. Stop the stream when you have enough footage. Live preview switches to the source chunk when you click a candidate.
+
 ## Whisper model and language choices
 
 - `large-v3` is the default accuracy-first choice. The app tries a CTranslate2 GPU backend and falls back to CPU int8 if GPU initialization or inference fails. On CPU, long streams can take a long time.
@@ -59,7 +68,7 @@ The app uses `faster-whisper`; there is no separate Whisper server to install. G
 
 The RX 7600 is an RDNA 3 GPU that CTranslate2 lists as supported through ROCm/HIP on Windows, but the standard Python install may not include that backend. See the [official Windows ROCm build guide](https://opennmt.net/CTranslate2/building_rocm_windows.html) if you want to enable it; the app's device probe will show whether your current install can see the GPU.
 
-For this repository on an RX 7600, close Clip Dhoot and run the included installer from the repo root:
+For this repository on an RX 7600, close Clip mocha and run the included installer from the repo root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_rocm_windows.ps1
@@ -88,4 +97,4 @@ Restart `bun run dev` after changing `.env`. AI ranking is optional and does not
 
 ## MVP notes
 
-The interface uses a charcoal and silver theme. Candidate suggestions are review prompts, not a promise of virality. The export center-fits the source over a blurred vertical background; check that the action and streamer remain visible. The tool does not capture live streams or publish to social accounts. Only create and post clips you have permission to use.
+The interface uses a charcoal and silver theme. Candidate suggestions are review prompts, not a promise of virality. The export center-fits the source over a blurred vertical background; check that the action and streamer remain visible. Social publishing is not implemented. Only capture and post streams or videos you have permission to use.

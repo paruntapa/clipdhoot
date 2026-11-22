@@ -5,8 +5,8 @@ import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join, extname, resolve, isAbsolute } from 'node:path';
 
 type Word = { start: number; end: number; text: string };
-type Candidate = { id: number; start: number; end: number; text: string; score: number; reason: string };
-type Job = { id: string; filename: string; words: Word[]; candidates: Candidate[]; duration: number; transcriptAvailable: boolean; whisperModel: string; whisperLanguage: string; whisperDevice?: string; detectedLanguage?: string; transcriptionError?: string };
+type Candidate = { id: number; start: number; end: number; text: string; score: number; reason: string; sourceFile?: string; sourceOffsetSeconds?: number };
+type Job = { id: string; filename: string; words: Word[]; candidates: Candidate[]; duration: number; transcriptAvailable: boolean; whisperModel: string; whisperLanguage: string; whisperDevice?: string; detectedLanguage?: string; transcriptionError?: string; status?: 'live' | 'stopping' | 'transcribing' | 'complete' | 'failed' | 'interrupted'; progress?: number; processedSeconds?: number; revision?: number; isLive?: boolean; streamUrl?: string; captureStartedAt?: number };
 type CaptionStyle = 'pop' | 'clean' | 'neon' | 'classic';
 const app = new Hono();
 const root = process.cwd();
@@ -14,6 +14,8 @@ const dataRoot = join(root, 'data');
 await mkdir(dataRoot, { recursive: true });
 const jobs = new Map<string, Job>();
 let transcriptionBusy = false;
+const liveControls = new Map<string, { stop: () => void }>();
+const liveStopRequests = new Set<string>();
 
 function run(command: string, args: string[], timeout = 60 * 60 * 1000): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolvePromise, reject) => {
@@ -27,7 +29,7 @@ function run(command: string, args: string[], timeout = 60 * 60 * 1000): Promise
     }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
-    Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+    Promise.all([new Response(child.stdout as ReadableStream<Uint8Array>).text(), new Response(child.stderr as ReadableStream<Uint8Array>).text(), child.exited])
       .then(([stdout, stderr, code]) => {
         clearTimeout(timer);
         if (timedOut) reject(new Error(`${command} timed out`));
@@ -43,10 +45,179 @@ async function loadJob(id: string): Promise<Job | undefined> {
   if (cached) return cached;
   try {
     const job = JSON.parse(await readFile(join(dataRoot, id, 'job.json'), 'utf8')) as Job;
+    if (['live', 'stopping', 'transcribing'].includes(job.status || '')) { job.status = 'interrupted'; job.transcriptionError = 'Server restarted while processing. Please start the live capture again.'; await writeFile(join(dataRoot, id, 'job.json'), JSON.stringify(job)); }
     jobs.set(id, job);
     return job;
   } catch {
     return undefined;
+  }
+}
+function mergeCandidates(job: Job, suggestions: Candidate[]) {
+  const added: Candidate[] = [];
+  for (const suggestion of suggestions) {
+    const existing = job.candidates.find(candidate => Math.abs(candidate.start - suggestion.start) < 18);
+    if (existing) { if (suggestion.score > existing.score) Object.assign(existing, suggestion, { id: existing.id }); continue; }
+    const candidate = { ...suggestion, id: Math.max(0, ...job.candidates.map(item => item.id)) + 1 };
+    job.candidates.push(candidate); added.push(candidate);
+  }
+  job.candidates.sort((a, b) => a.start - b.start);
+  return added;
+}
+async function saveJob(job: Job) { await writeFile(join(dataRoot, job.id, 'job.json'), JSON.stringify(job)); }
+async function transcribeJob(job: Job, videoPath: string) {
+  try {
+    const executable = resolve(root, '.venv/Scripts/python.exe');
+    const child = Bun.spawn([executable, 'scripts/transcribe.py', videoPath, job.whisperModel, job.whisperLanguage], { windowsHide: true, cwd: root, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const stderrPromise = new Response(child.stderr).text();
+    const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let buffer = ''; let lastPersist = 0;
+    const consume = async (line: string) => {
+      if (!line.trim()) return;
+      const event = JSON.parse(line);
+      if (event.type === 'started') job.whisperDevice = event.executionDevice;
+      if (event.type === 'reset') { job.words = []; job.candidates = []; job.progress = 0; job.processedSeconds = 0; job.revision = (job.revision || 0) + 1; job.detectedLanguage = undefined; job.whisperDevice = event.executionDevice; }
+      if (event.type === 'segment') {
+        job.words.push(...event.words); job.processedSeconds = Math.min(job.duration, event.progressSeconds); job.progress = Math.min(99, Math.round(job.processedSeconds / job.duration * 100));
+        job.detectedLanguage = event.detectedLanguage; job.whisperDevice = event.executionDevice;
+        const finalized = suggest(job.words).filter(candidate => candidate.end <= job.processedSeconds! - 8);
+        const added = mergeCandidates(job, finalized);
+        if (added.length || job.processedSeconds! - lastPersist >= 3) { lastPersist = job.processedSeconds!; await saveJob(job); }
+      }
+      if (event.type === 'done') { mergeCandidates(job, suggest(job.words)); job.transcriptAvailable = true; job.status = 'complete'; job.progress = 100; job.processedSeconds = job.duration; await saveJob(job); }
+    };
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, { stream: true }); const lines = buffer.split(/\r?\n/); buffer = lines.pop() || '';
+      for (const line of lines) await consume(line);
+    }
+    buffer += decoder.decode(); if (buffer.trim()) await consume(buffer);
+    const code = await child.exited; const stderr = await stderrPromise;
+    if (code !== 0) throw new Error(stderr.slice(-2500) || `Whisper exited ${code}`);
+  } catch (error) {
+    job.transcriptionError = error instanceof Error ? error.message.split('\n')[0] : 'Whisper transcription did not complete.';
+    try {
+      job.words = []; job.candidates = []; job.revision = (job.revision || 0) + 1; job.transcriptAvailable = false;
+      const audioPath = join(dataRoot, job.id, 'analysis.wav');
+      await run('ffmpeg', ['-y','-i',videoPath,'-vn','-ac','1','-ar','8000','-c:a','pcm_s16le',audioPath], 60 * 60 * 1000);
+      const ranked = await run(resolve(root, '.venv/Scripts/python.exe'), ['scripts/rank_audio.py', audioPath]);
+      job.candidates = JSON.parse(ranked.stdout) as Candidate[]; job.status = 'complete'; job.progress = 100; job.processedSeconds = job.duration;
+    } catch (fallbackError) { job.status = 'failed'; job.transcriptionError += `; audio fallback failed: ${fallbackError instanceof Error ? fallbackError.message : fallbackError}`; }
+    await saveJob(job);
+  } finally { transcriptionBusy = false; }
+}
+
+const wait = (ms: number) => new Promise(resolvePromise => setTimeout(resolvePromise, ms));
+function streamlinkHostAllowed(input: string) {
+  try {
+    const url = new URL(input);
+    return url.protocol === 'https:' && (url.hostname === 'twitch.tv' || url.hostname.endsWith('.twitch.tv'))
+      && !url.username && !url.password && (url.port === '' || url.port === '443')
+      && /^\/(?:[\w-]+)\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+async function processLiveChunk(job: Job, rawPath: string, chunkNumber: number, offset: number, transcribe: (path: string) => Promise<{ words: Word[]; language?: string }>) {
+  const dir = join(dataRoot, job.id); const chunkName = `chunk-${String(chunkNumber).padStart(5, '0')}.mp4`; const chunkPath = join(dir, chunkName);
+  await run('ffmpeg', ['-y','-hide_banner','-loglevel','error','-i',rawPath,'-map','0','-c','copy','-movflags','+faststart',chunkPath], 10 * 60 * 1000);
+  await unlink(rawPath).catch(() => {});
+  const probe = await run('ffprobe', ['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',chunkPath]);
+  const duration = Number(probe.stdout.trim());
+  if (!Number.isFinite(duration) || duration < 8) { await unlink(chunkPath).catch(() => {}); return offset; }
+  const result = await transcribe(chunkPath);
+  const globalWords = result.words.map(word => ({ ...word, start: word.start + offset, end: word.end + offset }));
+  job.words.push(...globalWords); job.duration = Math.max(job.duration, offset + duration); job.processedSeconds = job.duration;
+  if (result.language) job.detectedLanguage = result.language;
+  const suggestions = suggest(result.words).map(candidate => ({ ...candidate, start: candidate.start + offset, end: candidate.end + offset, sourceFile: chunkName, sourceOffsetSeconds: offset }));
+  mergeCandidates(job, suggestions);
+  await saveJob(job);
+  return offset + duration;
+}
+
+async function captureLive(job: Job, url: string) {
+  let streamlink: ReturnType<typeof Bun.spawn> | undefined; let ffmpeg: ReturnType<typeof Bun.spawn> | undefined; let worker: ReturnType<typeof Bun.spawn> | undefined;
+  let workerStdin: { write: (chunk: string | Uint8Array) => number; flush?: () => number | Promise<number>; end?: () => void } | undefined;
+  let workerRead: Promise<void> | undefined;
+  let pipePump: Promise<void> | undefined;
+  try {
+    const python = resolve(root, '.venv/Scripts/python.exe');
+    worker = Bun.spawn([python, 'scripts/transcribe_worker.py', job.whisperModel, job.whisperLanguage], { windowsHide: true, cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' });
+    workerStdin = worker.stdin as typeof workerStdin; const reader = (worker.stdout as ReadableStream<Uint8Array>).getReader(); const decoder = new TextDecoder();
+    let buffer = ''; let readyResolve!: (value: string) => void; let readyReject!: (reason: Error) => void;
+    const ready = new Promise<string>((resolveReady, rejectReady) => { readyResolve = resolveReady; readyReject = rejectReady; });
+    const pending = new Map<string, { words: Word[]; resolve: (value: { words: Word[]; language?: string }) => void; reject: (reason: Error) => void }>();
+    workerRead = (async () => {
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        buffer += decoder.decode(value, { stream: true }); const lines = buffer.split(/\r?\n/); buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (event.type === 'ready') { job.whisperDevice = event.executionDevice; readyResolve(event.executionDevice); continue; }
+          if (event.type === 'fatal') { readyReject(new Error(event.error)); continue; }
+          const item = pending.get(event.id); if (!item) continue;
+          if (event.type === 'started') job.whisperDevice = event.executionDevice;
+          if (event.type === 'reset') { item.words.length = 0; job.whisperDevice = event.executionDevice; }
+          if (event.type === 'segment') { item.words.push(...event.words); job.detectedLanguage = event.detectedLanguage; job.whisperDevice = event.executionDevice; }
+          if (event.type === 'done') { pending.delete(event.id); item.resolve({ words: item.words, language: job.detectedLanguage }); }
+          if (event.type === 'error') { pending.delete(event.id); item.reject(new Error(event.error)); }
+        }
+      }
+    })();
+    streamlink = Bun.spawn([python, '-m', 'streamlink', '--loglevel','warning','--stdout',url,'best'], { windowsHide: true, cwd: root, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const rawPattern = join(dataRoot, job.id, 'raw-%05d.ts');
+    ffmpeg = Bun.spawn(['ffmpeg','-y','-hide_banner','-loglevel','error','-i','pipe:0','-map','0','-c','copy','-f','segment','-segment_time','60','-reset_timestamps','1','-segment_format','mpegts',rawPattern], { windowsHide: true, cwd: root, stdin: 'pipe', stdout: 'ignore', stderr: 'pipe' });
+    const streamErr = new Response(streamlink.stderr as ReadableStream<Uint8Array>).text(); const ffmpegErr = new Response(ffmpeg.stderr as ReadableStream<Uint8Array>).text();
+    let stopped = liveStopRequests.has(job.id); let streamEnded = false; let ffmpegEnded = false;
+    const streamExit = streamlink.exited.then(code => { streamEnded = true; return code; });
+    const ffmpegExit = ffmpeg.exited.then(code => { ffmpegEnded = true; return code; });
+    const streamReader = (streamlink.stdout as ReadableStream<Uint8Array>).getReader();
+    const ffmpegStdin = ffmpeg.stdin as { write: (chunk: Uint8Array) => number; flush?: () => number | Promise<number>; end?: () => void };
+    liveControls.set(job.id, { stop: () => { stopped = true; streamlink?.kill(); } });
+    if (stopped) streamlink.kill();
+    pipePump = (async () => {
+      try { while (true) { const { value, done } = await streamReader.read(); if (done) break; ffmpegStdin.write(value); await Promise.resolve(ffmpegStdin.flush?.()); } }
+      catch { /* The pipeline may close when Streamlink or FFmpeg exits. */ }
+      finally { try { ffmpegStdin.end?.(); } catch {} }
+    })();
+    await ready;
+    const transcribe = (path: string) => new Promise<{ words: Word[]; language?: string }>((resolveResult, rejectResult) => {
+      const id = randomUUID(); pending.set(id, { words: [], resolve: resolveResult, reject: rejectResult });
+      try { workerStdin!.write(`${JSON.stringify({ id, path })}\n`); Promise.resolve(workerStdin!.flush?.()).catch(error => { pending.delete(id); rejectResult(error); }); }
+      catch (error) { pending.delete(id); rejectResult(error instanceof Error ? error : new Error(String(error))); }
+    });
+    let offset = 0; let nextChunk = 0;
+    while (!streamEnded && !ffmpegEnded && !stopped) {
+      const chunks = (await Array.fromAsync(new Bun.Glob('raw-*.ts').scan({ cwd: join(dataRoot, job.id) }))).sort();
+      const readyChunks = chunks.slice(0, Math.max(0, chunks.length - 1));
+      for (const name of readyChunks) {
+        if (Number(name.match(/raw-(\d+)\.ts/)?.[1]) !== nextChunk) continue;
+        offset = await processLiveChunk(job, join(dataRoot, job.id, name), nextChunk, offset, transcribe); nextChunk++;
+      }
+      await wait(1200);
+    }
+    if (!streamEnded && (ffmpegEnded || stopped)) streamlink.kill();
+    const streamCode = await streamExit; await pipePump; const ffmpegCode = await ffmpegExit;
+    const [streamErrorText, ffmpegErrorText] = await Promise.all([streamErr, ffmpegErr]);
+    if (ffmpegCode !== 0 && !stopped) throw new Error(ffmpegErrorText.slice(-1800) || `FFmpeg stream capture exited ${ffmpegCode}`);
+    if (streamCode !== 0 && !stopped && !job.duration) throw new Error(streamErrorText.slice(-1800) || 'Streamlink could not open this live stream.');
+    const finalChunks = (await Array.fromAsync(new Bun.Glob('raw-*.ts').scan({ cwd: join(dataRoot, job.id) }))).sort();
+    for (const name of finalChunks) {
+      if (Number(name.match(/raw-(\d+)\.ts/)?.[1]) !== nextChunk) continue;
+      offset = await processLiveChunk(job, join(dataRoot, job.id, name), nextChunk, offset, transcribe); nextChunk++;
+    }
+    if (!job.duration) throw new Error('No video segments were captured. Check that the stream is live and publicly accessible.');
+    job.status = 'complete'; job.progress = 100; job.processedSeconds = job.duration; await saveJob(job);
+  } catch (error) {
+    job.status = 'failed'; job.transcriptionError = error instanceof Error ? error.message.split('\n')[0] : 'Live capture failed.';
+    await saveJob(job);
+  } finally {
+    liveControls.delete(job.id);
+    liveStopRequests.delete(job.id);
+    try { workerStdin?.end?.(); } catch {}
+    if (worker) { worker.kill(); await worker.exited.catch(() => {}); }
+    await workerRead?.catch(() => {});
+    if (streamlink) { streamlink.kill(); await streamlink.exited.catch(() => {}); }
+    if (ffmpeg) { ffmpeg.kill(); await ffmpeg.exited.catch(() => {}); }
+    await pipePump?.catch(() => {});
+    transcriptionBusy = false;
   }
 }
 function suggest(words: Word[]): Candidate[] {
@@ -147,8 +318,7 @@ function makeAss(words: Word[], start: number, end: number, style: CaptionStyle)
   }, '');
   for (const word of selected) {
     const candidate = [...group, word];
-    const maxWords = style === 'classic' ? 3 : 5;
-    if (group.length && (candidate.length > maxWords || word.end - group[0]!.start > 2.5 || join(candidate).length > (style === 'classic' ? 30 : 34))) { groups.push(group); group = []; }
+    if (group.length && (candidate.length > 5 || word.end - group[0]!.start > 2.5 || join(candidate).length > 34)) { groups.push(group); group = []; }
     group.push(word);
     if (/[.!?]$/.test(word.text.trim()) && group.length >= 2) { groups.push(group); group = []; }
   }
@@ -176,6 +346,7 @@ app.get('/api/status', c => c.json({ aiEnabled: Boolean(process.env.OPENROUTER_A
 app.post('/api/process', async c => {
   if (transcriptionBusy) return c.json({ error: 'Another video is still processing. Wait for it to finish before selecting another.' }, 429);
   transcriptionBusy = true;
+  let workerStarted = false;
   try {
     const file = c.req.raw.body; const size = Number(c.req.header('content-length') || 0);
     if (!file) return c.json({ error: 'Choose a video file first.' }, 400);
@@ -195,25 +366,52 @@ app.post('/api/process', async c => {
     const videoPath = join(dir, `source${suffix}`); await Bun.write(videoPath, new Response(file));
     const probe = await run('ffprobe', ['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',videoPath]);
     const duration = Number(probe.stdout.trim()); if (!Number.isFinite(duration)) throw new Error('Could not read video duration.');
-    let words: Word[] = []; let candidates: Candidate[]; let transcriptAvailable = true; let detectedLanguage: string | undefined; let transcriptionError: string | undefined; let whisperDevice: string | undefined;
-    try {
-      const transcript = await run('.venv/Scripts/python.exe', ['scripts/transcribe.py', videoPath, whisperModel, whisperLanguage], 24 * 60 * 60 * 1000);
-      const parsed = JSON.parse(transcript.stdout) as { words: Word[]; detectedLanguage?: string; executionDevice?: string };
-      words = parsed.words; detectedLanguage = parsed.detectedLanguage; whisperDevice = parsed.executionDevice; candidates = suggest(words);
-    } catch (error) {
-      // Keep audio-only moment detection usable if local transcription cannot run.
-      transcriptAvailable = false;
-      transcriptionError = error instanceof Error ? error.message.split('\n')[0] : 'Whisper transcription did not complete.';
-      const audioPath = join(dir, 'analysis.wav');
-      await run('ffmpeg', ['-y','-i',videoPath,'-vn','-ac','1','-ar','8000','-c:a','pcm_s16le',audioPath], 60 * 60 * 1000);
-      const ranked = await run('.venv/Scripts/python.exe', ['scripts/rank_audio.py', audioPath]);
-      candidates = JSON.parse(ranked.stdout) as Candidate[];
-    }
-    const job = { id, filename, words, candidates, duration, transcriptAvailable, whisperModel, whisperLanguage, whisperDevice, detectedLanguage, transcriptionError };
-    jobs.set(id, job); await writeFile(join(dir, 'job.json'), JSON.stringify(job));
+    const job: Job = { id, filename, words: [], candidates: [], duration, transcriptAvailable: true, whisperModel, whisperLanguage, status: 'transcribing', progress: 0, processedSeconds: 0, revision: 0 };
+    jobs.set(id, job); await saveJob(job);
+    workerStarted = true;
+    void transcribeJob(job, videoPath);
     return c.json(job);
   } catch (e) { return c.json({ error: e instanceof Error ? e.message : 'Processing failed.' }, 500); }
-  finally { transcriptionBusy = false; }
+  finally { if (!workerStarted) transcriptionBusy = false; }
+});
+app.post('/api/live', async c => {
+  if (transcriptionBusy) return c.json({ error: 'Another video is still being processed. Stop it before starting a live stream.' }, 429);
+  let body: { url?: string; model?: string; language?: string };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Provide the live stream URL as JSON.' }, 400); }
+  const url = (body.url || '').trim();
+  if (!streamlinkHostAllowed(url)) return c.json({ error: 'For this MVP, enter a public Twitch channel URL such as https://www.twitch.tv/channelname.' }, 400);
+  transcriptionBusy = true;
+  try {
+    const id = randomUUID(); const dir = join(dataRoot, id); await mkdir(dir, { recursive: true });
+    const requestedLanguage = body.language || 'en';
+    const whisperLanguage = /^[a-z]{2,3}$/.test(requestedLanguage) || requestedLanguage === 'auto' ? requestedLanguage : 'en';
+    let whisperModel = ['small.en', 'medium.en', 'small', 'medium', 'large-v3'].includes(body.model || '') ? body.model! : 'large-v3';
+    if (whisperLanguage !== 'en' && whisperLanguage !== 'auto') {
+      if (whisperModel === 'small.en') whisperModel = 'small';
+      if (whisperModel === 'medium.en') whisperModel = 'medium';
+    }
+    const channel = new URL(url).pathname.split('/').filter(Boolean)[0] || 'Twitch stream';
+    const job: Job = { id, filename: `Live: ${channel}`, words: [], candidates: [], duration: 0, transcriptAvailable: true, whisperModel, whisperLanguage, status: 'live', progress: 0, processedSeconds: 0, revision: 0, isLive: true, streamUrl: url, captureStartedAt: Date.now() };
+    jobs.set(id, job); await saveJob(job);
+    void captureLive(job, url);
+    return c.json(job);
+  } catch (error) {
+    transcriptionBusy = false;
+    return c.json({ error: error instanceof Error ? error.message : 'Could not start live capture.' }, 500);
+  }
+});
+app.post('/api/jobs/:id/stop-live', async c => {
+  const job = await loadJob(c.req.param('id'));
+  if (!job || !job.isLive) return c.json({ error: 'Live job not found.' }, 404);
+  const control = liveControls.get(job.id);
+  job.status = 'stopping'; await saveJob(job); liveStopRequests.add(job.id); control?.stop();
+  return c.json({ status: 'stopping' });
+});
+app.get('/api/jobs/:id/progress', async c => {
+  const job = await loadJob(c.req.param('id'));
+  if (!job) return c.json({ error: 'Job not found.' }, 404);
+  const captureSeconds = job.isLive && job.status !== 'complete' && job.captureStartedAt ? Math.max(job.duration, (Date.now() - job.captureStartedAt) / 1000) : job.duration;
+  return c.json({ id: job.id, status: job.status || 'complete', progress: job.progress ?? 100, processedSeconds: job.processedSeconds ?? job.duration, duration: job.duration, captureSeconds, candidates: job.candidates, transcriptAvailable: job.transcriptAvailable, whisperModel: job.whisperModel, whisperLanguage: job.whisperLanguage, whisperDevice: job.whisperDevice, detectedLanguage: job.detectedLanguage, transcriptionError: job.transcriptionError, wordCount: job.words.length, revision: job.revision || 0, isLive: job.isLive });
 });
 app.get('/api/jobs/:id', async c => {
   const job = await loadJob(c.req.param('id'));
@@ -225,7 +423,7 @@ app.post('/api/jobs/:id/rank', async c => {
   if (!job) return c.json({ error: 'Process a video first.' }, 404);
   if (!process.env.OPENROUTER_API_KEY) return c.json({ error: 'Add OPENROUTER_API_KEY to .env to use AI ranking.' }, 400);
   try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Clipdhoot' }, body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite', temperature: 0.2, messages: [{ role: 'system', content: 'Rank candidate transcript moments for short-form clips. Prefer a compelling opening, coherent standalone context, emotion, surprise, humor, or useful insight. Do not claim virality. Return only JSON: {"order":[candidate ids],"notes":{"id":"short reason"}}.' }, { role: 'user', content: JSON.stringify(job.candidates.map(({id,start,end,text}) => ({id,start:Math.round(start),end:Math.round(end),text:text.slice(0,1400)}))) }] }) });
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Clipmocha' }, body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite', temperature: 0.2, messages: [{ role: 'system', content: 'Rank candidate transcript moments for short-form clips. Prefer a compelling opening, coherent standalone context, emotion, surprise, humor, or useful insight. Do not claim virality. Return only JSON: {"order":[candidate ids],"notes":{"id":"short reason"}}.' }, { role: 'user', content: JSON.stringify(job.candidates.map(({id,start,end,text}) => ({id,start:Math.round(start),end:Math.round(end),text:text.slice(0,1400)}))) }] }) });
     if (!response.ok) throw new Error(`OpenRouter returned ${response.status}: ${(await response.text()).slice(0, 500)}`);
     const data = await response.json() as any; const raw = data.choices?.[0]?.message?.content || ''; const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));
     const map = new Map(job.candidates.map(x => [x.id, x]));
@@ -237,9 +435,18 @@ app.post('/api/jobs/:id/export', async c => {
   const job = await loadJob(c.req.param('id'));
   if (!job) return c.json({ error: 'Process a video first.' }, 404);
   try {
-    const body = await c.req.json() as { start: number; end: number; text: string; vertical: boolean; style?: CaptionStyle; layout?: 'auto' | 'blur' };
+    const body = await c.req.json() as { start: number; end: number; text: string; vertical: boolean; style?: CaptionStyle; layout?: 'auto' | 'blur'; sourceFile?: string; sourceOffsetSeconds?: number };
     const dir = join(dataRoot, job.id); const files = await Array.fromAsync(new Bun.Glob('source.*').scan({ cwd: dir }));
-    const source = join(dir, files[0] || ''); const output = join(dir, `clip-${Math.round(body.start)}-${Math.round(body.end)}.mp4`);
+    const sourceName = body.sourceFile && /^chunk-\d{5}\.mp4$/.test(body.sourceFile) ? body.sourceFile : files[0];
+    if (!sourceName) return c.json({ error: 'The source video for this clip is no longer available.' }, 404);
+    const source = join(dir, sourceName); const sourceOffset = Number.isFinite(body.sourceOffsetSeconds) ? Math.max(0, body.sourceOffsetSeconds!) : 0;
+    const sourceProbe = await run('ffprobe', ['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',source]);
+    const sourceDuration = Number(sourceProbe.stdout.trim());
+    const localStart = Math.max(0, body.start - sourceOffset);
+    if (!Number.isFinite(sourceDuration) || localStart >= sourceDuration) return c.json({ error: 'The selected clip start is outside its source segment.' }, 400);
+    const localEnd = Math.min(sourceDuration, Math.max(localStart + 1, body.end - sourceOffset));
+    const clipDuration = localEnd - localStart;
+    const output = join(dir, `clip-${Math.round(body.start)}-${Math.round(body.end)}.mp4`);
     const caption = body.text.replace(/\s+/g, ' ').trim().replace(/[{}]/g, '');
     const style: CaptionStyle = body.style && body.style in assStyles ? body.style : 'pop';
     const ass = job.transcriptAvailable ? makeAss(job.words, body.start, body.end, style) : '';
@@ -260,7 +467,7 @@ app.post('/api/jobs/:id/export', async c => {
     if (body.vertical && requestedLayout !== 'blur') {
       const stacked = join(dir, `stacked-${Math.round(body.start)}-${Math.round(body.end)}.mp4`);
       try {
-        await run('.venv/Scripts/python.exe', ['scripts/facecam_stack.py', source, String(body.start), String(body.end), stacked, join(root, 'assets/face_landmarker.task')], 30 * 60 * 1000);
+        await run('.venv/Scripts/python.exe', ['scripts/facecam_stack.py', source, String(localStart), String(localEnd), stacked, join(root, 'assets/face_landmarker.task')], 30 * 60 * 1000);
         videoInput = stacked;
         renderedLayout = 'stack';
       } catch (error) {
@@ -280,8 +487,8 @@ app.post('/api/jobs/:id/export', async c => {
       ? `[0:v]${overlay}[outv]`
       : `${graph};[base]${overlay}[outv]`;
     ffmpegArgs = renderedLayout === 'stack'
-      ? ['-y','-i',videoInput,'-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','1:a:0?','-c:v','libx264','-preset','veryfast','-crf','22','-c:a','aac','-b:a','160k','-movflags','+faststart',output]
-      : ['-y','-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',output];
+      ? ['-y','-i',videoInput,'-ss',String(localStart),'-i',source,'-t',String(clipDuration),'-filter_complex',filters,'-map','[outv]','-map','1:a:0?','-c:v','libx264','-preset','veryfast','-crf','22','-c:a','aac','-b:a','160k','-movflags','+faststart',output]
+      : ['-y','-ss',String(localStart),'-i',source,'-t',String(clipDuration),'-filter_complex',filters,'-map','[outv]','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',output];
     try { await run('ffmpeg', ffmpegArgs, 30 * 60 * 1000); }
     finally { if (renderedLayout === 'stack') await unlink(videoInput).catch(() => {}); }
     return c.json({ url: `/api/jobs/${job.id}/download/${encodeURIComponent(output.split(/[\\/]/).at(-1)!)}`, layout: renderedLayout, layoutMessage });
@@ -296,8 +503,17 @@ app.get('/api/jobs/:id/stream', async c => {
   const id = c.req.param('id');
   if (!/^[\da-f-]{36}$/i.test(id)) return c.text('Video not found.', 404);
   try {
-    const files = await Array.fromAsync(new Bun.Glob('source.*').scan({ cwd: join(dataRoot,id) }));
-    const path = join(dataRoot,id,files[0]!); const file = Bun.file(path); const size = file.size;
+    const dir = join(dataRoot, id); const requested = c.req.query('source');
+    let name: string | undefined;
+    if (requested && (/^source\.[\w.-]+$/.test(requested) || /^chunk-\d{5}\.mp4$/.test(requested))) name = requested;
+    else if (requested) return c.text('Invalid source.', 400);
+    if (!name) {
+      const sources = await Array.fromAsync(new Bun.Glob('source.*').scan({ cwd: dir }));
+      const chunks = (await Array.fromAsync(new Bun.Glob('chunk-*.mp4').scan({ cwd: dir }))).sort();
+      name = sources[0] || chunks.at(-1);
+    }
+    if (!name) return c.text('Video segment is not ready yet.', 404);
+    const path = join(dir,name); const file = Bun.file(path); if (!(await file.exists())) return c.text('Video segment not found.', 404); const size = file.size;
     const ext = extname(path).toLowerCase(); const type = ({ '.mp4':'video/mp4','.mov':'video/quicktime','.webm':'video/webm','.mkv':'video/x-matroska' } as Record<string,string>)[ext] || 'application/octet-stream';
     const range = c.req.header('range');
     if (range) {

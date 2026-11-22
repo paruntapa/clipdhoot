@@ -44,3 +44,48 @@ def transcribe(model_name: str, audio_path: str, language: str | None = None, **
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         segments, info = model.transcribe(audio_path, language=language, **options)
         return list(segments), info, "CPU (GPU failed; fell back)"
+
+
+class WhisperStream:
+    """Keep one model loaded while a live capture is analyzed chunk by chunk."""
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.model, self.device = create_model(model_name)
+
+    def transcribe(self, audio_path: str, language: str | None = None, **options):
+        model, device = self.model, self.device
+        yield {"type": "started", "executionDevice": device}
+        try:
+            segments, info = model.transcribe(audio_path, language=language, **options)
+            for segment in segments:
+                yield {"type": "segment", "segment": segment, "info": info, "executionDevice": device}
+        except Exception:
+            if device == "CPU (no usable GPU backend)" or device.startswith("CPU"):
+                raise
+            del model
+            gc.collect()
+            self.model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+            self.device = "CPU (GPU failed; restarting transcript)"
+            model, device = self.model, self.device
+            yield {"type": "reset", "executionDevice": device}
+            segments, info = model.transcribe(audio_path, language=language, **options)
+            for segment in segments:
+                yield {"type": "segment", "segment": segment, "info": info, "executionDevice": device}
+
+    @property
+    def model_name(self):
+        return self._model_name
+
+    @model_name.setter
+    def model_name(self, value):
+        self._model_name = value
+
+
+def create_transcriber(model_name: str):
+    return WhisperStream(model_name)
+
+
+def transcribe_stream(model_name: str, audio_path: str, language: str | None = None, **options):
+    """Yield completed Whisper segments immediately; restart cleanly on a GPU failure."""
+    transcriber = create_transcriber(model_name)
+    yield from transcriber.transcribe(audio_path, language=language, **options)

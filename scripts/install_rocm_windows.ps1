@@ -11,7 +11,7 @@ if ($pythonVersion -ne '3.11') {
   throw "The bundled Windows ROCm wheel is configured for Python 3.11; found $pythonVersion."
 }
 
-$scratch = Join-Path $env:TEMP ("clipdhoot-rocm-" + [guid]::NewGuid().ToString('N'))
+$scratch = Join-Path $env:TEMP ("clipmocha-rocm-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $cpuWheel = $null
 try {
@@ -52,7 +52,7 @@ if count < 1:
 '@
   $verify | & $python -
   if ($LASTEXITCODE -ne 0) { throw 'GPU verification failed; CTranslate2 cannot see an available GPU.' }
-  Write-Host 'GPU transcription is ready. Restart Clip Dhoot before processing a video.'
+  Write-Host 'GPU transcription is ready. Restart Clip mocha before processing a video.'
 }
 catch {
   if ($cpuWheel) {
