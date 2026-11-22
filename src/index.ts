@@ -121,7 +121,7 @@ app.post('/api/jobs/:id/export', async c => {
     const graph = body.vertical
       ? `[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:12,eq=brightness=-0.25[bgblur];[fg]scale=1080:-2:force_original_aspect_ratio=decrease[fgfit];[bgblur][fgfit]overlay=(W-w)/2:(H-h)/2[base]`
       : '[0:v]scale=1920:-2:force_original_aspect_ratio=decrease[base]';
-    const filters = `${graph};[base]${caption ? `drawtext=textfile='${captionFile}':fontcolor=white:fontsize=42:borderw=3:bordercolor=black:box=1:boxcolor=black@0.48:boxborderw=12:x=(w-text_w)/2:y=h*0.76` : 'null'}[outv]`;
+    const filters = `${graph};[base]${caption ? `drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':textfile='${captionFile}':fontcolor=white:fontsize=42:borderw=3:bordercolor=black:box=1:boxcolor=black@0.48:boxborderw=12:x=(w-text_w)/2:y=h*0.76` : 'null'}[outv]`;
     await run('ffmpeg', ['-y','-ss',String(Math.max(0,body.start)),'-i',source,'-t',String(Math.max(1,body.end-body.start)),'-filter_complex',filters,'-map','[outv]','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',output], 30 * 60 * 1000);
     return c.json({ url: `/api/jobs/${job.id}/download/${encodeURIComponent(output.split(/[\\/]/).at(-1)!)}` });
   } catch (e) { return c.json({ error: e instanceof Error ? e.message : 'Export failed.' }, 500); }
