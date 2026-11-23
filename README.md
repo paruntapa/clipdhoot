@@ -63,14 +63,32 @@ Open [http://localhost:3000](http://localhost:3000). Keep that terminal open whi
 5. Choose **Classic**, **Pop**, **Clean**, or **Neon** under Caption look. Classic uses bold Montserrat captions with a black outline and highlights the spoken word in yellow. Captions are timed from Whisper word timestamps.
 6. Click **Export clip**. The app renders a 9:16 MP4 and downloads it through your browser. Watch the finished clip and correct any Whisper errors before posting.
 
-## Capture a live Twitch stream
+While a video is uploading, use **Cancel upload** to stop it. Once transcription begins, **Stop processing** terminates the local Whisper process and keeps any suggestions found so far. The app becomes available for another video after the worker exits.
+
+## Connect Instagram and publish a Reel
+
+1. Create a Zernio account and API key from the [Zernio dashboard](https://zernio.com/dashboard/api-keys). Zernio's first two connected social accounts are included on its free plan; check its [pricing page](https://docs.zernio.com/pricing) for current limits.
+2. Put the key in the root `.env` file and restart Clip mocha:
+
+   ```dotenv
+   ZERNIO_API_KEY=your_zernio_key_here
+   ```
+
+3. Click **Connect Instagram** in the app and authorize an Instagram Business or Creator account. Personal Instagram accounts cannot publish through this API. On return, the connected account is listed in the app. Select the account you want Clip mocha to use; that selection is saved under the ignored `data/` folder and survives a page refresh.
+4. Render a clip. Use the **Instagram** action on its candidate card or open its preview, edit the Instagram post caption, and choose **Publish to Instagram**. The post caption is separate from the word-timed on-video captions already burned into the MP4.
+
+Rendered clips are temporary until you click **Save** on a candidate. Saved clips move into `data/saved-clips/`, persist across refresh and restart, and are capped at 10. The library supports preview, download, Instagram publishing, individual deletion, selection, and bulk deletion. Deleting a saved clip does not remove the original video/job.
+
+The Zernio API key stays on the local server and is never sent to the browser. Rendered MP4s are uploaded from this machine to Zernio's temporary media storage, then submitted as Reels. Publishing needs an internet connection and is subject to Instagram and Zernio account limits. Instagram videos are limited to 300 MB and captions to 2,200 characters.
+
+## Capture a live Twitch or YouTube stream
 
 1. Paste a public Twitch channel URL such as `https://www.twitch.tv/channelname` into **Capture a live stream**.
 2. Use the same Whisper model and language selectors as for a video. The stream is captured immediately while the model loads.
 3. The app writes approximately 60-second video chunks, remuxes each finished chunk, and transcribes it locally. New candidate cards appear after a chunk has been captured and analyzed; the app does not wait for the stream to end.
 4. Review and export ready candidates while capture continues. Stop with **Stop live capture**; Clip mocha finishes the current segment and then processes the final chunk.
 
-The live MVP currently accepts public Twitch channel links. A chunk must finish before it can be transcribed, so suggestions are delayed by the chunk length plus local transcription time. With a slower CPU or a large Whisper model, transcription can fall behind capture and use additional disk space. Stop the stream when you have enough footage. Live preview switches to the source chunk when you click a candidate.
+The live MVP currently accepts public Twitch and YouTube live links. A chunk must finish before it can be transcribed, so suggestions are delayed by the chunk length plus local transcription time. With a slower CPU or a large Whisper model, transcription can fall behind capture and use additional disk space. Stop the stream when you have enough footage. Live preview switches to the source chunk when you click a candidate.
 
 ## Whisper model and language choices
 
@@ -114,4 +132,4 @@ Restart `bun run dev` after changing `.env`. AI ranking is optional and does not
 
 ## MVP notes
 
-The interface uses a charcoal and silver theme. Candidate suggestions are review prompts, not a promise of virality. The export center-fits the source over a blurred vertical background; check that the action and streamer remain visible. Social publishing is not implemented. Only capture and post streams or videos you have permission to use.
+The interface uses a charcoal and silver theme. Candidate suggestions are review prompts, not a promise of virality. The export center-fits the source over a blurred vertical background; check that the action and streamer remain visible. Only capture and post streams or videos you have permission to use.
