@@ -22,12 +22,29 @@ git clone <repository-url> clipmocha
 cd clipmocha
 bun install
 py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+$clipdhootPython = Join-Path (Get-Location) '.venv\Scripts\python.exe'
+& $clipdhootPython -m pip install --upgrade pip
+& $clipdhootPython -m pip install -r requirements.txt
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
 The first transcription downloads the selected faster-whisper model automatically. large-v3 is selected by default and may take several minutes to download. Model files are stored in the local Hugging Face cache, not in the Git repository. You need internet access for that first model download; video transcription and rendering then run on your computer.
+
+### Fix a clone that starts but does not transcribe
+
+If the site opens after `bun run dev` but transcription fails or only audio-scan suggestions appear, stop the app with `Ctrl+C` and run these commands from the repository root in PowerShell. They install Whisper into the project's virtual environment, not system Python:
+
+```powershell
+py -3.11 -m venv .venv
+$clipdhootPython = Join-Path (Get-Location) '.venv\Scripts\python.exe'
+Test-Path $clipdhootPython
+& $clipdhootPython -m pip install --upgrade pip
+& $clipdhootPython -m pip install -r requirements.txt
+& $clipdhootPython -c "from faster_whisper import WhisperModel; print('faster-whisper is installed')"
+bun run dev
+```
+
+This project uses **faster-whisper**; do not install `openai-whisper` for it. The selected model (large-v3 by default) downloads the first time a video is processed, so leave the app open and allow that first run to finish. GPU support is optional; transcription falls back to CPU when a supported GPU backend is unavailable.
 
 ## 3. Start the app
 
