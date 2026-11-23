@@ -132,7 +132,7 @@ function openPublishDialog(context) {
   confirmBtn.disabled = false;
   confirmBtn.textContent = 'Publish Now 🚀';
 
-  let initialTitle = (context.title || '').trim();
+  let initialTitle = (context.candidate?.title || context.title || '').trim();
   if (!initialTitle) {
     const raw = (context.caption || context.candidate?.text || '').trim();
     if (raw) {
@@ -145,11 +145,16 @@ function openPublishDialog(context) {
     }
   }
   pubTitle.value = initialTitle.slice(0, 100);
-  pubInstagramCaption.value = context.caption || context.candidate?.text || '';
-  pubYoutubeDescription.value = context.caption || context.candidate?.text || '';
+  pubInstagramCaption.value = context.candidate?.instagramCaption || context.caption || context.candidate?.text || '';
+  pubYoutubeDescription.value = context.candidate?.youtubeDescription || context.caption || context.candidate?.text || '';
 
-  pubSyncDesc.checked = true;
-  pubYoutubeDescription.classList.add('hidden');
+  if (context.candidate?.instagramCaption && context.candidate?.youtubeDescription && context.candidate.instagramCaption !== context.candidate.youtubeDescription) {
+    pubSyncDesc.checked = false;
+    pubYoutubeDescription.classList.remove('hidden');
+  } else {
+    pubSyncDesc.checked = true;
+    pubYoutubeDescription.classList.add('hidden');
+  }
 
   pubDestInstagram.checked = instagramAccounts.length > 0;
   pubDestYoutube.checked = youtubeAccounts.length > 0;
@@ -678,7 +683,10 @@ function render(candidates, { preserve = false, transcribing = false } = {}) {
     card.dataset.candidateId = candidate.id;
     if (candidate.sourceFile) card.dataset.sourceFile = candidate.sourceFile;
     card.dataset.sourceOffset = candidate.sourceOffsetSeconds || 0;
-    card.innerHTML = `<div class="cardtop"><span>${time(candidate.start)} — ${time(candidate.end)}</span><span class="score">${candidate.score} match</span></div><blockquote></blockquote><div class="reason"></div><textarea class="caption" rows="2" placeholder="Optional on-screen caption"></textarea><div class="cardactions"><label>In <input class="start" type="number" step="0.5" value="${candidate.start.toFixed(1)}"></label><label>Out <input class="end" type="number" step="0.5" value="${candidate.end.toFixed(1)}"></label><button class="preview-btn secondary">Preview ▶</button><button class="export">Export clip ↓</button></div>`;
+    card.innerHTML = `<div class="cardtop"><span>${time(candidate.start)} — ${time(candidate.end)}</span><div style="display:flex;align-items:center;gap:6px">${candidate.aiGenerated ? '<span class="card-ai-badge">✨ AI Viral Pick</span>' : ''}<span class="score">${candidate.score} match</span></div></div>${candidate.title ? `<div class="card-title"></div>` : ''}<blockquote></blockquote><div class="reason"></div><textarea class="caption" rows="2" placeholder="Optional on-screen caption"></textarea><div class="cardactions"><label>In <input class="start" type="number" step="0.5" value="${candidate.start.toFixed(1)}"></label><label>Out <input class="end" type="number" step="0.5" value="${candidate.end.toFixed(1)}"></label><button class="preview-btn secondary">Preview ▶</button><button class="export">Export clip ↓</button></div>`;
+    if (candidate.title) {
+      card.querySelector('.card-title').textContent = candidate.title;
+    }
     card.querySelector('blockquote').textContent = candidate.text || 'Listen and review the visual context around this audio peak.';
     card.querySelector('.reason').textContent = candidate.reason;
     card.querySelector('.caption').value = candidate.text || '';
@@ -694,6 +702,7 @@ function render(candidates, { preserve = false, transcribing = false } = {}) {
       filename: renderedFilename,
       caption: card.querySelector('.caption').value || candidate.text || '',
       candidate,
+      title: candidate.title,
     });
     const saveButton = document.createElement('button');
     saveButton.className = 'card-save secondary';

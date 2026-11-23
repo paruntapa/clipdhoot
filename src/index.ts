@@ -5,7 +5,7 @@ import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/pro
 import { join, extname, resolve, isAbsolute } from 'node:path';
 
 type Word = { start: number; end: number; text: string };
-type Candidate = { id: number; start: number; end: number; text: string; score: number; reason: string; sourceFile?: string; sourceOffsetSeconds?: number };
+type Candidate = { id: number; start: number; end: number; text: string; score: number; reason: string; sourceFile?: string; sourceOffsetSeconds?: number; title?: string; instagramCaption?: string; youtubeDescription?: string; aiGenerated?: boolean; hook?: string };
 type LayoutCrop = { hasCam: boolean; cam?: number[]; game?: number[]; width?: number; height?: number; error?: string };
 type Job = { id: string; filename: string; words: Word[]; candidates: Candidate[]; duration: number; transcriptAvailable: boolean; whisperModel: string; whisperLanguage: string; whisperDevice?: string; detectedLanguage?: string; transcriptionError?: string; status?: 'live' | 'stopping' | 'transcribing' | 'cancelling' | 'cancelled' | 'complete' | 'failed' | 'interrupted'; progress?: number; processedSeconds?: number; revision?: number; isLive?: boolean; streamUrl?: string; captureStartedAt?: number; layoutCrop?: LayoutCrop };
 type CaptionStyle = 'pop' | 'clean' | 'neon' | 'classic';
@@ -85,12 +85,209 @@ function mergeCandidates(job: Job, suggestions: Candidate[]) {
   const added: Candidate[] = [];
   for (const suggestion of suggestions) {
     const existing = job.candidates.find(candidate => Math.abs(candidate.start - suggestion.start) < 18);
-    if (existing) { if (suggestion.score > existing.score) Object.assign(existing, suggestion, { id: existing.id }); continue; }
+    if (existing) {
+      if (suggestion.aiGenerated || suggestion.score >= existing.score) {
+        Object.assign(existing, suggestion, { id: existing.id });
+      }
+      continue;
+    }
     const candidate = { ...suggestion, id: Math.max(0, ...job.candidates.map(item => item.id)) + 1 };
-    job.candidates.push(candidate); added.push(candidate);
+    job.candidates.push(candidate);
+    added.push(candidate);
   }
   job.candidates.sort((a, b) => a.start - b.start);
   return added;
+}
+
+function formatTimeCode(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function parseTimestampToSeconds(val: any, windowMin: number, windowMax: number): number {
+  if (typeof val === 'number') {
+    if (val < windowMin * 0.1 && windowMin > 100) {
+      const converted = val * 60;
+      if (converted >= windowMin - 20 && converted <= windowMax + 20) return converted;
+    }
+    return val;
+  }
+  if (typeof val === 'string') {
+    const parts = val.trim().split(':');
+    if (parts.length === 3) return Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]);
+    if (parts.length === 2) return Number(parts[0]) * 60 + Number(parts[1]);
+    const num = Number(val);
+    return Number.isFinite(num) ? num : NaN;
+  }
+  return NaN;
+}
+
+function formatTranscriptForAI(words: Word[]): string {
+  if (!words.length) return '';
+  const lines: string[] = [];
+  let line: Word[] = [];
+  for (const word of words) {
+    line.push(word);
+    const text = word.text.trim();
+    const hasPunctuation = /[.!?]$/.test(text);
+    const prev = line[line.length - 2];
+    const pause = prev && (word.start - prev.end > 1.1);
+    if (hasPunctuation || line.length >= 14 || pause) {
+      const sec = Math.round(line[0].start);
+      lines.push(`[${formatTimeCode(line[0].start)} / ${sec}s] ${line.map(w => w.text).join(' ').trim()}`);
+      line = [];
+    }
+  }
+  if (line.length) {
+    const sec = Math.round(line[0].start);
+    lines.push(`[${formatTimeCode(line[0].start)} / ${sec}s] ${line.map(w => w.text).join(' ').trim()}`);
+  }
+  return lines.join('\n');
+}
+
+async function extractViralCandidatesWithAI(
+  job: Job,
+  words: Word[],
+  options?: { sourceFile?: string; sourceOffsetSeconds?: number; minDuration?: number; maxDuration?: number }
+): Promise<Candidate[]> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey || !words.length) return [];
+
+  const transcript = formatTranscriptForAI(words);
+  if (!transcript || transcript.length < 40) return [];
+
+  const model = process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite';
+  const windowMin = Math.round(words[0].start);
+  const windowMax = Math.round(words[words.length - 1].end);
+  const durationSec = windowMax - windowMin;
+
+  const prompt = `You are an elite short-form video editor for TikTok, YouTube Shorts, and Instagram Reels.
+Analyze this timestamped transcript segment (from ${windowMin}s to ${windowMax}s, duration ${durationSec}s) and identify the top 1 to 3 viral standalone moments with high engagement potential.
+
+Criteria for viral moments:
+1. Irresistible 3-Second Hook: Starts with an engaging line, question, high-stakes statement, surprise, or emotional spike.
+2. Emotional Peak or Climax: A funny punchline, dramatic twist, intense clutch, shock, or relatable observation.
+3. Standalone Coherence: A viewer with no prior context will understand and be hooked by the clip.
+4. Target Duration: 18 to 60 seconds (ideal for retention and completion rate).
+5. Exact Timestamps: Use the total seconds given in brackets like [MM:SS / Xs] to provide start and end as total seconds (e.g. start: ${windowMin + 15}.0, end: ${windowMin + 50}.0).
+
+Return ONLY a valid JSON object matching this structure:
+{
+  "moments": [
+    {
+      "start": ${windowMin + 15}.0,
+      "end": ${windowMin + 50}.0,
+      "score": 94,
+      "hook": "Opening hook phrase or description",
+      "reason": "Detailed reason why this will perform well on social media",
+      "title": "Short Punchy Title (under 80 chars) #Shorts",
+      "instagramCaption": "Engaging reel caption with 3-6 relevant hashtags",
+      "youtubeDescription": "2-3 sentence video summary for YouTube"
+    }
+  ]
+}
+
+TRANSCRIPT:
+${transcript}`;
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'http://localhost:3000',
+        'X-Title': 'Clipdhoot'
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.3,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      console.error(`OpenRouter AI virality extraction failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
+      return [];
+    }
+
+    const data = await response.json() as any;
+    const rawContent = data.choices?.[0]?.message?.content || '';
+    const jsonMatch = rawContent.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn('OpenRouter returned non-JSON content:', rawContent.slice(0, 200));
+      return [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const rawMoments = Array.isArray(parsed.moments) ? parsed.moments : (Array.isArray(parsed.candidates) ? parsed.candidates : []);
+    const results: Candidate[] = [];
+
+    for (const moment of rawMoments) {
+      const rawStart = parseTimestampToSeconds(moment.start, windowMin, windowMax);
+      const rawEnd = parseTimestampToSeconds(moment.end, windowMin, windowMax);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawEnd <= rawStart) continue;
+
+      const matchingWords = words.filter(w => w.end >= rawStart - 5 && w.start <= rawEnd + 5);
+      if (!matchingWords.length) continue;
+
+      let startWord = matchingWords[0];
+      let minStartDiff = Math.abs(startWord.start - rawStart);
+      for (const w of matchingWords) {
+        const diff = Math.abs(w.start - rawStart);
+        if (diff < minStartDiff) {
+          minStartDiff = diff;
+          startWord = w;
+        }
+      }
+
+      let endWord = matchingWords[matchingWords.length - 1];
+      let minEndDiff = Math.abs(endWord.end - rawEnd);
+      for (const w of matchingWords) {
+        const diff = Math.abs(w.end - rawEnd);
+        if (diff < minEndDiff) {
+          minEndDiff = diff;
+          endWord = w;
+        }
+      }
+
+      let snappedStart = Math.max(0, startWord.start - 0.25);
+      let snappedEnd = endWord.end + 0.4;
+
+      if (snappedEnd - snappedStart < 12) snappedEnd = snappedStart + 15;
+      if (snappedEnd - snappedStart > 75) snappedEnd = snappedStart + 60;
+
+      const clipWords = words.filter(w => w.start >= snappedStart - 0.2 && w.end <= snappedEnd + 0.2);
+      const text = clipWords.map(w => w.text).join(' ').trim() || moment.hook || 'AI viral highlight';
+
+      const candidate: Candidate = {
+        id: 0,
+        start: Number(snappedStart.toFixed(1)),
+        end: Number(snappedEnd.toFixed(1)),
+        text,
+        score: Math.min(99, Math.max(75, Math.round(Number(moment.score) || 88))),
+        reason: moment.reason || 'AI identified high viral potential',
+        hook: moment.hook,
+        title: moment.title ? String(moment.title).trim() : undefined,
+        instagramCaption: moment.instagramCaption ? String(moment.instagramCaption).trim() : undefined,
+        youtubeDescription: moment.youtubeDescription ? String(moment.youtubeDescription).trim() : undefined,
+        aiGenerated: true,
+        sourceFile: options?.sourceFile,
+        sourceOffsetSeconds: options?.sourceOffsetSeconds
+      };
+      results.push(candidate);
+    }
+
+    if (results.length) {
+      mergeCandidates(job, results);
+      await saveJob(job);
+    }
+    return results;
+  } catch (error) {
+    console.error('Error in extractViralCandidatesWithAI:', error);
+    return [];
+  }
 }
 async function saveJob(job: Job) { await writeFile(join(dataRoot, job.id, 'job.json'), JSON.stringify(job)); }
 type ZernioSettings = {
@@ -161,6 +358,7 @@ async function transcribeJob(job: Job, videoPath: string) {
     registerStop(() => child.kill());
     const stderrPromise = new Response(child.stderr).text();
     const reader = child.stdout.getReader(); const decoder = new TextDecoder(); let buffer = ''; let lastPersist = 0;
+    let lastAiWindowEnd = 0;
     const consume = async (line: string) => {
       if (!line.trim()) return;
       const event = JSON.parse(line);
@@ -172,8 +370,27 @@ async function transcribeJob(job: Job, videoPath: string) {
         const finalized = suggest(job.words).filter(candidate => candidate.end <= job.processedSeconds! - 8);
         const added = mergeCandidates(job, finalized);
         if (added.length || job.processedSeconds! - lastPersist >= 3) { lastPersist = job.processedSeconds!; await saveJob(job); }
+        if (job.processedSeconds! - lastAiWindowEnd >= 600 && process.env.OPENROUTER_API_KEY) {
+          const windowStart = Math.max(0, lastAiWindowEnd - 120);
+          const windowEnd = job.processedSeconds!;
+          const windowWords = job.words.filter(w => w.start >= windowStart && w.end <= windowEnd);
+          lastAiWindowEnd = windowEnd;
+          if (windowWords.length >= 15) {
+            extractViralCandidatesWithAI(job, windowWords).catch(err => console.error('AI background extraction error:', err));
+          }
+        }
       }
-      if (event.type === 'done') { mergeCandidates(job, suggest(job.words)); job.transcriptAvailable = true; job.status = 'complete'; job.progress = 100; job.processedSeconds = job.duration; await saveJob(job); }
+      if (event.type === 'done') {
+        mergeCandidates(job, suggest(job.words));
+        job.transcriptAvailable = true; job.status = 'complete'; job.progress = 100; job.processedSeconds = job.duration;
+        await saveJob(job);
+        if (process.env.OPENROUTER_API_KEY && (job.duration - lastAiWindowEnd >= 30 || lastAiWindowEnd === 0)) {
+          const remainingWords = lastAiWindowEnd === 0 ? job.words : job.words.filter(w => w.start >= Math.max(0, lastAiWindowEnd - 120));
+          if (remainingWords.length >= 15) {
+            extractViralCandidatesWithAI(job, remainingWords).catch(err => console.error('AI final extraction error:', err));
+          }
+        }
+      }
     };
     while (true) {
       const { value, done } = await reader.read(); if (done) break;
@@ -268,6 +485,10 @@ async function processLiveChunk(job: Job, rawPath: string, chunkNumber: number, 
   const suggestions = suggest(result.words).map(candidate => ({ ...candidate, start: candidate.start + offset, end: candidate.end + offset, sourceFile: chunkName, sourceOffsetSeconds: offset }));
   mergeCandidates(job, suggestions);
   await saveJob(job);
+  if (process.env.OPENROUTER_API_KEY && result.words.length >= 10) {
+    extractViralCandidatesWithAI(job, globalWords, { sourceFile: chunkName, sourceOffsetSeconds: offset })
+      .catch(err => console.error('Live AI candidate extraction error:', err));
+  }
   return offset + duration;
 }
 
@@ -483,6 +704,23 @@ function makeAss(words: Word[], start: number, end: number, style: CaptionStyle)
 }
 
 app.get('/api/status', c => c.json({ aiEnabled: Boolean(process.env.OPENROUTER_API_KEY), model: process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite' }));
+app.get('/api/gpu-status', async c => {
+  try {
+    const python = resolve(root, '.venv/Scripts/python.exe');
+    const probe = await run(python, ['-c', 'import sys; sys.path.insert(0, "scripts"); import whisper_runtime, ctranslate2; print(ctranslate2.get_cuda_device_count()); print(whisper_runtime.get_gpu_name() or "None")']);
+    const lines = probe.stdout.trim().split(/\r?\n/);
+    const count = Number(lines[0]) || 0;
+    const name = lines[1] || 'Unknown';
+    return c.json({
+      hasGpu: count > 0,
+      gpuCount: count,
+      gpuName: name,
+      backend: count > 0 ? (name.includes('Radeon') || name.includes('AMD') ? 'ROCm' : 'CUDA') : 'CPU',
+    });
+  } catch (e) {
+    return c.json({ hasGpu: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
 app.get('/api/social/instagram/status', async c => {
   if (!process.env.ZERNIO_API_KEY) return c.json({ configured: false, accounts: [] });
   try {
@@ -1048,13 +1286,24 @@ app.post('/api/jobs/:id/rank', async c => {
   if (!job) return c.json({ error: 'Process a video first.' }, 404);
   if (!process.env.OPENROUTER_API_KEY) return c.json({ error: 'Add OPENROUTER_API_KEY to .env to use AI ranking.' }, 400);
   try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Clipmocha' }, body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite', temperature: 0.2, messages: [{ role: 'system', content: 'Rank candidate transcript moments for short-form clips. Prefer a compelling opening, coherent standalone context, emotion, surprise, humor, or useful insight. Do not claim virality. Return only JSON: {"order":[candidate ids],"notes":{"id":"short reason"}}.' }, { role: 'user', content: JSON.stringify(job.candidates.map(({id,start,end,text}) => ({id,start:Math.round(start),end:Math.round(end),text:text.slice(0,1400)}))) }] }) });
-    if (!response.ok) throw new Error(`OpenRouter returned ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    const data = await response.json() as any; const raw = data.choices?.[0]?.message?.content || ''; const parsed = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ''));
-    const map = new Map(job.candidates.map(x => [x.id, x]));
-    const ranked = (parsed.order as number[]).map(id => map.get(id)).filter(Boolean).map((x: any, i: number) => ({ ...x, score: Math.max(50, 99 - i * 4), reason: parsed.notes?.[x.id] || 'AI ranked this candidate highly' }));
-    return c.json({ candidates: ranked });
-  } catch (e) { return c.json({ error: e instanceof Error ? e.message : 'AI ranking failed.' }, 502); }
+    if (job.words && job.words.length >= 10) {
+      const windowSize = 600;
+      const step = 480;
+      const maxTime = job.duration || (job.words[job.words.length - 1]?.end ?? 0);
+      for (let t = 0; t < maxTime; t += step) {
+        const sliceWords = job.words.filter(w => w.start >= t && w.end <= t + windowSize);
+        if (sliceWords.length >= 15) {
+          await extractViralCandidatesWithAI(job, sliceWords);
+        }
+        if (t + windowSize >= maxTime) break;
+      }
+    }
+    job.candidates.sort((a, b) => b.score - a.score);
+    await saveJob(job);
+    return c.json({ candidates: job.candidates });
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'AI ranking failed.' }, 502);
+  }
 });
 app.post('/api/jobs/:id/export', async c => {
   const job = await loadJob(c.req.param('id'));
